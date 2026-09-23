@@ -1,95 +1,13 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import type { PluginInput } from "@opencode-ai/plugin";
-
 import EnvSitterGuard from "../index.js";
 
-type MatchOp =
-    | "exists"
-    | "is_empty"
-    | "is_equal"
-    | "partial_match_prefix"
-    | "partial_match_suffix"
-    | "partial_match_regex"
-    | "is_number"
-    | "is_boolean"
-    | "is_string";
+import type { ToolInfo } from "./helpers.js";
 
-type ScanDetection = "jwt" | "url" | "base64";
-
-type ToolApi = {
-    envsitter_keys: {
-        execute: (args: { filePath?: string; filterRegex?: string }) => Promise<string>;
-    };
-    envsitter_fingerprint: {
-        execute: (args: { filePath?: string; key: string }) => Promise<string>;
-    };
-    envsitter_match: {
-        execute: (args: {
-            filePath?: string;
-            op?: MatchOp;
-            key?: string;
-            keys?: string[];
-            allKeys?: boolean;
-            candidate?: string;
-            candidateEnvVar?: string;
-        }) => Promise<string>;
-    };
-    envsitter_match_by_key: {
-        execute: (args: {
-            filePath?: string;
-            candidatesByKey?: Record<string, string>;
-            candidatesByKeyJson?: string;
-            candidatesByKeyEnvVar?: string;
-        }) => Promise<string>;
-    };
-    envsitter_scan: {
-        execute: (args: { filePath?: string; detect?: ScanDetection[]; keysFilterRegex?: string }) => Promise<string>;
-    };
-    envsitter_validate: {
-        execute: (args: { filePath?: string }) => Promise<string>;
-    };
-    envsitter_copy: {
-        execute: (args: {
-            from: string;
-            to: string;
-            keys?: string[];
-            includeRegex?: string;
-            excludeRegex?: string;
-            rename?: string;
-            onConflict?: "error" | "skip" | "overwrite";
-            write?: boolean;
-        }) => Promise<string>;
-    };
-    envsitter_format: {
-        execute: (args: {
-            filePath?: string;
-            mode?: "sections" | "global";
-            sort?: "alpha" | "none";
-            write?: boolean;
-        }) => Promise<string>;
-    };
-    envsitter_reorder: {
-        execute: (args: {
-            filePath?: string;
-            mode?: "sections" | "global";
-            sort?: "alpha" | "none";
-            write?: boolean;
-        }) => Promise<string>;
-    };
-    envsitter_annotate: {
-        execute: (args: { filePath?: string; key: string; comment: string; line?: number; write?: boolean }) => Promise<string>;
-    };
-};
-
-async function createTmpDir(): Promise<string> {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "envsitter-guard-"));
-    return dir;
-}
+import { createFakeContext, createTmpDir } from "./helpers.js";
 
 async function withEnvVar<T>(name: string, value: string, fn: () => Promise<T>): Promise<T> {
     const previous = process.env[name];
@@ -110,32 +28,10 @@ async function withPepper<T>(fn: () => Promise<T>): Promise<T> {
     return withEnvVar("ENVSITTER_PEPPER", "test-pepper", fn);
 }
 
-function createMinimalClient(): PluginInput["client"] {
-    return {
-        tui: {
-            async showToast() {},
-            async appendPrompt() {},
-        },
-    } as unknown as PluginInput["client"];
-}
-
-async function getTools(params: { directory: string; worktree: string }): Promise<ToolApi> {
-    const pluginInput: PluginInput = {
-        client: createMinimalClient(),
-        project: {} as unknown as PluginInput["project"],
-        directory: params.directory,
-        worktree: params.worktree,
-        serverUrl: new URL("http://localhost"),
-        $: (() => {
-            throw new Error("not used in tests");
-        }) as unknown as PluginInput["$"],
-    };
-
-    const hooks = (await EnvSitterGuard(pluginInput)) as unknown as {
-        tool: ToolApi;
-    };
-
-    return hooks.tool;
+async function getTools(params: { directory: string; worktree: string }): Promise<Record<string, ToolInfo>> {
+    const fake = createFakeContext(params);
+    await EnvSitterGuard.setup(fake.ctx);
+    return fake.tools;
 }
 
 test("envsitter_keys lists keys without values", async () => {
@@ -144,14 +40,14 @@ test("envsitter_keys lists keys without values", async () => {
         await fs.writeFile(path.join(worktree, ".env"), "FOO=bar\nBAZ=qux\n");
 
         const tools = await getTools({ directory: worktree, worktree });
-        const out = await tools.envsitter_keys.execute({ filePath: ".env" });
+        const out = (await tools.envsitter_keys.execute({ filePath: ".env" })).content;
 
         assert.ok(!out.includes("bar"));
         assert.ok(!out.includes("qux"));
 
         const parsed = JSON.parse(out) as { file: string; keys: string[] };
         assert.equal(parsed.file, ".env");
-        assert.deepEqual(parsed.keys.sort(), ["BAZ", "FOO"].sort());
+        assert.deepEqual([...parsed.keys].sort((a, b) => a.localeCompare(b)), ["BAZ", "FOO"]);
     });
 });
 
@@ -161,7 +57,7 @@ test("envsitter_keys supports filterRegex", async () => {
         await fs.writeFile(path.join(worktree, ".env"), "FOO=bar\nBAZ=qux\n");
 
         const tools = await getTools({ directory: worktree, worktree });
-        const out = await tools.envsitter_keys.execute({ filePath: ".env", filterRegex: "/^FOO$/" });
+        const out = (await tools.envsitter_keys.execute({ filePath: ".env", filterRegex: "/^FOO$/" })).content;
 
         const parsed = JSON.parse(out) as { keys: string[] };
         assert.deepEqual(parsed.keys, ["FOO"]);
@@ -174,8 +70,8 @@ test("envsitter_fingerprint is deterministic and does not leak values", async ()
         await fs.writeFile(path.join(worktree, ".env"), "DATABASE_URL=postgres://user:pass@host/db\n");
 
         const tools = await getTools({ directory: worktree, worktree });
-        const out1 = await tools.envsitter_fingerprint.execute({ filePath: ".env", key: "DATABASE_URL" });
-        const out2 = await tools.envsitter_fingerprint.execute({ filePath: ".env", key: "DATABASE_URL" });
+        const out1 = (await tools.envsitter_fingerprint.execute({ filePath: ".env", key: "DATABASE_URL" })).content;
+        const out2 = (await tools.envsitter_fingerprint.execute({ filePath: ".env", key: "DATABASE_URL" })).content;
 
         assert.ok(!out1.includes("postgres://"));
         assert.equal(out1, out2);
@@ -192,7 +88,7 @@ test("envsitter_match supports exists", async () => {
         await fs.writeFile(path.join(worktree, ".env"), "FOO=bar\n");
 
         const tools = await getTools({ directory: worktree, worktree });
-        const out = await tools.envsitter_match.execute({ filePath: ".env", key: "FOO", op: "exists" });
+        const out = (await tools.envsitter_match.execute({ filePath: ".env", key: "FOO", op: "exists" })).content;
 
         const parsed = JSON.parse(out) as { key: string; match: boolean };
         assert.equal(parsed.key, "FOO");
@@ -207,12 +103,14 @@ test("envsitter_match supports is_equal via candidateEnvVar", async () => {
 
         await withEnvVar("ENVSITTER_TEST_CANDIDATE", "bar", async () => {
             const tools = await getTools({ directory: worktree, worktree });
-            const out = await tools.envsitter_match.execute({
-                filePath: ".env",
-                key: "FOO",
-                op: "is_equal",
-                candidateEnvVar: "ENVSITTER_TEST_CANDIDATE",
-            });
+            const out = (
+                await tools.envsitter_match.execute({
+                    filePath: ".env",
+                    key: "FOO",
+                    op: "is_equal",
+                    candidateEnvVar: "ENVSITTER_TEST_CANDIDATE",
+                })
+            ).content;
 
             assert.ok(!out.includes("bar"));
 
@@ -228,7 +126,7 @@ test("envsitter_match supports bulk keys", async () => {
         await fs.writeFile(path.join(worktree, ".env"), "FOO=bar\n");
 
         const tools = await getTools({ directory: worktree, worktree });
-        const out = await tools.envsitter_match.execute({ filePath: ".env", keys: ["FOO", "BAZ"], op: "exists" });
+        const out = (await tools.envsitter_match.execute({ filePath: ".env", keys: ["FOO", "BAZ"], op: "exists" })).content;
 
         const parsed = JSON.parse(out) as { matches: Array<{ key: string; match: boolean }> };
         const byKey = new Map(parsed.matches.map((entry) => [entry.key, entry.match]));
@@ -243,13 +141,15 @@ test("envsitter_match_by_key matches candidates without leaking values", async (
         await fs.writeFile(path.join(worktree, ".env"), "FOO=bar\nBAZ=qux\n");
 
         const tools = await getTools({ directory: worktree, worktree });
-        const out = await tools.envsitter_match_by_key.execute({
-            filePath: ".env",
-            candidatesByKey: {
-                FOO: "bar",
-                BAZ: "nope",
-            },
-        });
+        const out = (
+            await tools.envsitter_match_by_key.execute({
+                filePath: ".env",
+                candidatesByKey: {
+                    FOO: "bar",
+                    BAZ: "nope",
+                },
+            })
+        ).content;
 
         assert.ok(!out.includes("bar"));
         assert.ok(!out.includes("qux"));
@@ -278,7 +178,7 @@ test("envsitter_scan detects shapes without leaking values", async () => {
         );
 
         const tools = await getTools({ directory: worktree, worktree });
-        const out = await tools.envsitter_scan.execute({ filePath: ".env", detect: ["jwt", "url", "base64"] });
+        const out = (await tools.envsitter_scan.execute({ filePath: ".env", detect: ["jwt", "url", "base64"] })).content;
 
         assert.ok(!out.includes(jwt));
         assert.ok(!out.includes("https://example.com"));
@@ -320,11 +220,15 @@ test("envsitter_validate returns issues without leaking values", async () => {
     await fs.writeFile(path.join(worktree, ".env"), "GOOD=supersecret\nBAD\n");
 
     const tools = await getTools({ directory: worktree, worktree });
-    const out = await tools.envsitter_validate.execute({ filePath: ".env" });
+    const out = (await tools.envsitter_validate.execute({ filePath: ".env" })).content;
 
     assert.ok(!out.includes("supersecret"));
 
-    const parsed = JSON.parse(out) as { file: string; ok: boolean; issues: Array<{ line: number; column: number; message: string }> };
+    const parsed = JSON.parse(out) as {
+        file: string;
+        ok: boolean;
+        issues: Array<{ line: number; column: number; message: string }>;
+    };
     assert.equal(parsed.file, ".env");
     assert.equal(parsed.ok, false);
     assert.ok(parsed.issues.length > 0);
@@ -337,12 +241,14 @@ test("envsitter_copy dry-runs unless write=true", async () => {
 
     const tools = await getTools({ directory: worktree, worktree });
 
-    const outDryRun = await tools.envsitter_copy.execute({
-        from: ".env.production",
-        to: ".env.staging",
-        keys: ["BAZ"],
-        onConflict: "overwrite",
-    });
+    const outDryRun = (
+        await tools.envsitter_copy.execute({
+            from: ".env.production",
+            to: ".env.staging",
+            keys: ["BAZ"],
+            onConflict: "overwrite",
+        })
+    ).content;
 
     assert.ok(!outDryRun.includes("bar"));
     assert.ok(!outDryRun.includes("qux"));
@@ -350,13 +256,15 @@ test("envsitter_copy dry-runs unless write=true", async () => {
     const stagingAfterDryRun = await fs.readFile(path.join(worktree, ".env.staging"), "utf8");
     assert.ok(!stagingAfterDryRun.includes("BAZ=qux"));
 
-    const outWrite = await tools.envsitter_copy.execute({
-        from: ".env.production",
-        to: ".env.staging",
-        keys: ["BAZ"],
-        onConflict: "overwrite",
-        write: true,
-    });
+    const outWrite = (
+        await tools.envsitter_copy.execute({
+            from: ".env.production",
+            to: ".env.staging",
+            keys: ["BAZ"],
+            onConflict: "overwrite",
+            write: true,
+        })
+    ).content;
 
     assert.ok(!outWrite.includes("bar"));
     assert.ok(!outWrite.includes("qux"));
@@ -370,7 +278,9 @@ test("envsitter_format sorts keys without leaking values", async () => {
     await fs.writeFile(path.join(worktree, ".env"), "B=2\nA=1\n");
 
     const tools = await getTools({ directory: worktree, worktree });
-    const out = await tools.envsitter_format.execute({ filePath: ".env", mode: "global", sort: "alpha", write: true });
+    const out = (
+        await tools.envsitter_format.execute({ filePath: ".env", mode: "global", sort: "alpha", write: true })
+    ).content;
 
     assert.ok(!out.includes("=1"));
     assert.ok(!out.includes("=2"));
@@ -384,7 +294,9 @@ test("envsitter_annotate adds comments without leaking values", async () => {
     await fs.writeFile(path.join(worktree, ".env"), "FOO=bar\n");
 
     const tools = await getTools({ directory: worktree, worktree });
-    const out = await tools.envsitter_annotate.execute({ filePath: ".env", key: "FOO", comment: "prod only", write: true });
+    const out = (
+        await tools.envsitter_annotate.execute({ filePath: ".env", key: "FOO", comment: "prod only", write: true })
+    ).content;
 
     assert.ok(!out.includes("bar"));
 

@@ -1,5 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin";
-import { tool } from "@opencode-ai/plugin/tool";
+import { Plugin } from "@opencode/plugin";
 import {
     EnvSitter,
     addEnvFileKey,
@@ -86,16 +85,6 @@ function resolveCandidate(params: { candidate?: string; candidateEnvVar?: string
     throw new Error("Candidate is required for this operation. Provide `candidate` or `candidateEnvVar`.");
 }
 
-function getFilePathFromArgs(args: unknown): string | undefined {
-    if (!args || typeof args !== "object") return;
-    const record = args as Record<string, unknown>;
-
-    const candidates: Array<unknown> = [record.filePath, record.path, record.file_path];
-
-    const found = candidates.find((value) => typeof value === "string") as string | undefined;
-    return found ? stripAtPrefix(found) : undefined;
-}
-
 function resolveDotEnvPath(params: {
     worktree: string;
     directory: string;
@@ -120,30 +109,48 @@ function resolveDotEnvPath(params: {
     return { absolutePath, displayPath: relativeToWorktree };
 }
 
-export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
-    const matchOps = [
-        "exists",
-        "is_empty",
-        "is_equal",
-        "partial_match_prefix",
-        "partial_match_suffix",
-        "partial_match_regex",
-        "is_number",
-        "is_boolean",
-        "is_string",
-    ] as const;
+function extractPatchTargets(patchText: string): string[] {
+    const targets: string[] = [];
+    for (const match of patchText.matchAll(/^\*\*\* (?:Add|Update|Delete|Move) File: (.+)$/gm)) {
+        const spec = match[1].trim();
+        if (spec.includes(" -> ")) {
+            // Move format: "*** Move File: <source> -> <destination>"; guard both ends.
+            const [source, destination] = spec.split(" -> ");
+            targets.push(source.trim(), destination.trim());
+        } else {
+            targets.push(spec);
+        }
+    }
+    return targets;
+}
 
-    const scanDetections = ["jwt", "url", "base64"] as const;
+function referencesSensitiveEnvFile(ref: string): boolean {
+    if (isSensitiveDotEnvPath(ref) || isEnvSitterPepperPath(ref)) return true;
+    const collapsed = ref.replace(/[*?[\]{}]/g, "");
+    return collapsed !== ref && (isSensitiveDotEnvPath(collapsed) || isEnvSitterPepperPath(collapsed));
+}
 
-    return {
-        tool: {
-            envsitter_keys: tool({
+export const EnvSitterGuard: Plugin.Plugin = Plugin.define({
+    id: "envsitter-guard",
+    async setup(ctx) {
+        const directory = ctx.location.directory;
+        const worktree = ctx.location.project.directory || ctx.location.directory;
+
+        await ctx.tool.transform((editor) => {
+            editor.add({
+                name: "envsitter_keys",
                 description: "List keys in a .env file (never returns values).",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    filterRegex: tool.schema.string().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        filterRegex: { type: "string" },
+                    },
+                    required: [],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as { filePath?: string; filterRegex?: string };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -159,16 +166,23 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                             : undefined,
                     );
 
-                    return JSON.stringify({ file: resolved.displayPath, keys }, null, 2);
+                    return { content: JSON.stringify({ file: resolved.displayPath, keys }, null, 2) };
                 },
-            }),
-            envsitter_fingerprint: tool({
+            });
+            editor.add({
+                name: "envsitter_fingerprint",
                 description: "Compute a deterministic fingerprint for a single key (never returns the value).",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    key: tool.schema.string(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        key: { type: "string" },
+                    },
+                    required: ["key"],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as { filePath?: string; key: string };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -178,22 +192,59 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                     const es = EnvSitter.fromDotenvFile(resolved.absolutePath);
                     const result = await es.fingerprintKey(args.key);
 
-                    return JSON.stringify({ file: resolved.displayPath, key: args.key, result }, null, 2);
+                    return { content: JSON.stringify({ file: resolved.displayPath, key: args.key, result }, null, 2) };
                 },
-            }),
-            envsitter_match: tool({
+            });
+            editor.add({
+                name: "envsitter_match",
                 description:
                     "Match key values without printing them. Supports existence/shape checks and outside-in candidate matching.",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    op: tool.schema.enum(matchOps).optional(),
-                    key: tool.schema.string().optional(),
-                    keys: tool.schema.array(tool.schema.string()).optional(),
-                    allKeys: tool.schema.boolean().optional(),
-                    candidate: tool.schema.string().optional(),
-                    candidateEnvVar: tool.schema.string().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        op: {
+                            type: "string",
+                            enum: [
+                                "exists",
+                                "is_empty",
+                                "is_equal",
+                                "partial_match_prefix",
+                                "partial_match_suffix",
+                                "partial_match_regex",
+                                "is_number",
+                                "is_boolean",
+                                "is_string",
+                            ],
+                        },
+                        key: { type: "string" },
+                        keys: { type: "array", items: { type: "string" } },
+                        allKeys: { type: "boolean" },
+                        candidate: { type: "string" },
+                        candidateEnvVar: { type: "string" },
+                    },
+                    required: [],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as {
+                        filePath?: string;
+                        op?:
+                            | "exists"
+                            | "is_empty"
+                            | "is_equal"
+                            | "partial_match_prefix"
+                            | "partial_match_suffix"
+                            | "partial_match_regex"
+                            | "is_number"
+                            | "is_boolean"
+                            | "is_string";
+                        key?: string;
+                        keys?: string[];
+                        allKeys?: boolean;
+                        candidate?: string;
+                        candidateEnvVar?: string;
+                    };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -252,7 +303,7 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                             matcher.op === "is_equal" && typeof isEqualCandidate === "string"
                                 ? await es.matchCandidate(key, isEqualCandidate)
                                 : await es.matchKey(key, matcher);
-                        return JSON.stringify({ file: resolved.displayPath, key, op: matcher.op, match }, null, 2);
+                        return { content: JSON.stringify({ file: resolved.displayPath, key, op: matcher.op, match }, null, 2) };
                     }
 
                     if (Array.isArray(keys) && keys.length > 0) {
@@ -260,25 +311,37 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                             matcher.op === "is_equal" && typeof isEqualCandidate === "string"
                                 ? await es.matchCandidateBulk(keys, isEqualCandidate)
                                 : await es.matchKeyBulk(keys, matcher);
-                        return JSON.stringify({ file: resolved.displayPath, op: matcher.op, matches }, null, 2);
+                        return { content: JSON.stringify({ file: resolved.displayPath, op: matcher.op, matches }, null, 2) };
                     }
 
                     const matches =
                         matcher.op === "is_equal" && typeof isEqualCandidate === "string"
                             ? await es.matchCandidateAll(isEqualCandidate)
                             : await es.matchKeyAll(matcher);
-                    return JSON.stringify({ file: resolved.displayPath, op: matcher.op, matches }, null, 2);
+                    return { content: JSON.stringify({ file: resolved.displayPath, op: matcher.op, matches }, null, 2) };
                 },
-            }),
-            envsitter_match_by_key: tool({
+            });
+            editor.add({
+                name: "envsitter_match_by_key",
                 description: "Bulk match candidates-by-key without printing values (returns booleans only).",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    candidatesByKey: tool.schema.record(tool.schema.string(), tool.schema.string()).optional(),
-                    candidatesByKeyJson: tool.schema.string().optional(),
-                    candidatesByKeyEnvVar: tool.schema.string().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        candidatesByKey: { type: "object", additionalProperties: { type: "string" } },
+                        candidatesByKeyJson: { type: "string" },
+                        candidatesByKeyEnvVar: { type: "string" },
+                    },
+                    required: [],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as {
+                        filePath?: string;
+                        candidatesByKey?: Record<string, string>;
+                        candidatesByKeyJson?: string;
+                        candidatesByKeyEnvVar?: string;
+                    };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -336,17 +399,24 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                     const es = EnvSitter.fromDotenvFile(resolved.absolutePath);
                     const matches = await es.matchCandidatesByKey(candidatesByKey);
 
-                    return JSON.stringify({ file: resolved.displayPath, matches }, null, 2);
+                    return { content: JSON.stringify({ file: resolved.displayPath, matches }, null, 2) };
                 },
-            }),
-            envsitter_scan: tool({
+            });
+            editor.add({
+                name: "envsitter_scan",
                 description: "Scan value shapes (jwt/url/base64) without printing values.",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    detect: tool.schema.array(tool.schema.enum(scanDetections)).optional(),
-                    keysFilterRegex: tool.schema.string().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        detect: { type: "array", items: { type: "string", enum: ["jwt", "url", "base64"] } },
+                        keysFilterRegex: { type: "string" },
+                    },
+                    required: [],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as { filePath?: string; detect?: ("jwt" | "url" | "base64")[]; keysFilterRegex?: string };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -359,15 +429,22 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                         keysFilter: args.keysFilterRegex ? parseUserRegExp(args.keysFilterRegex) : undefined,
                     });
 
-                    return JSON.stringify({ file: resolved.displayPath, findings }, null, 2);
+                    return { content: JSON.stringify({ file: resolved.displayPath, findings }, null, 2) };
                 },
-            }),
-            envsitter_validate: tool({
+            });
+            editor.add({
+                name: "envsitter_validate",
                 description: "Validate dotenv syntax (never returns values).",
-                args: {
-                    filePath: tool.schema.string().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                    },
+                    required: [],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as { filePath?: string };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -375,23 +452,39 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                     });
 
                     const result = await validateEnvFile(resolved.absolutePath);
-                    return JSON.stringify({ file: resolved.displayPath, ok: result.ok, issues: result.issues }, null, 2);
+                    return { content: JSON.stringify({ file: resolved.displayPath, ok: result.ok, issues: result.issues }, null, 2) };
                 },
-            }),
-            envsitter_copy: tool({
+            });
+            editor.add({
+                name: "envsitter_copy",
                 description:
                     "Copy keys between dotenv files safely (no values in output). Dry-run unless `write: true`.",
-                args: {
-                    from: tool.schema.string(),
-                    to: tool.schema.string(),
-                    keys: tool.schema.array(tool.schema.string()).optional(),
-                    includeRegex: tool.schema.string().optional(),
-                    excludeRegex: tool.schema.string().optional(),
-                    rename: tool.schema.string().optional(),
-                    onConflict: tool.schema.enum(["error", "skip", "overwrite"] as const).optional(),
-                    write: tool.schema.boolean().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        from: { type: "string" },
+                        to: { type: "string" },
+                        keys: { type: "array", items: { type: "string" } },
+                        includeRegex: { type: "string" },
+                        excludeRegex: { type: "string" },
+                        rename: { type: "string" },
+                        onConflict: { type: "string", enum: ["error", "skip", "overwrite"] },
+                        write: { type: "boolean" },
+                    },
+                    required: ["from", "to"],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as {
+                        from: string;
+                        to: string;
+                        keys?: string[];
+                        includeRegex?: string;
+                        excludeRegex?: string;
+                        rename?: string;
+                        onConflict?: "error" | "skip" | "overwrite";
+                        write?: boolean;
+                    };
                     const resolvedFrom = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -419,31 +512,45 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                         write: args.write === true,
                     });
 
-                    return JSON.stringify(
-                        {
-                            from: resolvedFrom.displayPath,
-                            to: resolvedTo.displayPath,
-                            onConflict: result.onConflict,
-                            willWrite: result.willWrite,
-                            wrote: result.wrote,
-                            hasChanges: result.hasChanges,
-                            issues: result.issues,
-                            plan: result.plan,
-                        },
-                        null,
-                        2,
-                    );
+                    return {
+                        content: JSON.stringify(
+                            {
+                                from: resolvedFrom.displayPath,
+                                to: resolvedTo.displayPath,
+                                onConflict: result.onConflict,
+                                willWrite: result.willWrite,
+                                wrote: result.wrote,
+                                hasChanges: result.hasChanges,
+                                issues: result.issues,
+                                plan: result.plan,
+                            },
+                            null,
+                            2,
+                        ),
+                    };
                 },
-            }),
-            envsitter_format: tool({
+            });
+            editor.add({
+                name: "envsitter_format",
                 description: "Format/reorder a dotenv file (no values in output). Dry-run unless `write: true`.",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    mode: tool.schema.enum(["sections", "global"] as const).optional(),
-                    sort: tool.schema.enum(["alpha", "none"] as const).optional(),
-                    write: tool.schema.boolean().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        mode: { type: "string", enum: ["sections", "global"] },
+                        sort: { type: "string", enum: ["alpha", "none"] },
+                        write: { type: "boolean" },
+                    },
+                    required: [],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as {
+                        filePath?: string;
+                        mode?: "sections" | "global";
+                        sort?: "alpha" | "none";
+                        write?: boolean;
+                    };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -457,30 +564,44 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                         write: args.write === true,
                     });
 
-                    return JSON.stringify(
-                        {
-                            file: resolved.displayPath,
-                            mode: result.mode,
-                            sort: result.sort,
-                            willWrite: result.willWrite,
-                            wrote: result.wrote,
-                            hasChanges: result.hasChanges,
-                            issues: result.issues,
-                        },
-                        null,
-                        2,
-                    );
+                    return {
+                        content: JSON.stringify(
+                            {
+                                file: resolved.displayPath,
+                                mode: result.mode,
+                                sort: result.sort,
+                                willWrite: result.willWrite,
+                                wrote: result.wrote,
+                                hasChanges: result.hasChanges,
+                                issues: result.issues,
+                            },
+                            null,
+                            2,
+                        ),
+                    };
                 },
-            }),
-            envsitter_reorder: tool({
+            });
+            editor.add({
+                name: "envsitter_reorder",
                 description: "Alias for envsitter_format.",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    mode: tool.schema.enum(["sections", "global"] as const).optional(),
-                    sort: tool.schema.enum(["alpha", "none"] as const).optional(),
-                    write: tool.schema.boolean().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        mode: { type: "string", enum: ["sections", "global"] },
+                        sort: { type: "string", enum: ["alpha", "none"] },
+                        write: { type: "boolean" },
+                    },
+                    required: [],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as {
+                        filePath?: string;
+                        mode?: "sections" | "global";
+                        sort?: "alpha" | "none";
+                        write?: boolean;
+                    };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -494,31 +615,46 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                         write: args.write === true,
                     });
 
-                    return JSON.stringify(
-                        {
-                            file: resolved.displayPath,
-                            mode: result.mode,
-                            sort: result.sort,
-                            willWrite: result.willWrite,
-                            wrote: result.wrote,
-                            hasChanges: result.hasChanges,
-                            issues: result.issues,
-                        },
-                        null,
-                        2,
-                    );
+                    return {
+                        content: JSON.stringify(
+                            {
+                                file: resolved.displayPath,
+                                mode: result.mode,
+                                sort: result.sort,
+                                willWrite: result.willWrite,
+                                wrote: result.wrote,
+                                hasChanges: result.hasChanges,
+                                issues: result.issues,
+                            },
+                            null,
+                            2,
+                        ),
+                    };
                 },
-            }),
-            envsitter_annotate: tool({
+            });
+            editor.add({
+                name: "envsitter_annotate",
                 description: "Annotate a dotenv key with a comment (no values in output). Dry-run unless `write: true`.",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    key: tool.schema.string(),
-                    comment: tool.schema.string(),
-                    line: tool.schema.number().int().optional(),
-                    write: tool.schema.boolean().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        key: { type: "string" },
+                        comment: { type: "string" },
+                        line: { type: "integer" },
+                        write: { type: "boolean" },
+                    },
+                    required: ["key", "comment"],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as {
+                        filePath?: string;
+                        key: string;
+                        comment: string;
+                        line?: number;
+                        write?: boolean;
+                    };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -537,31 +673,40 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                         write: args.write === true,
                     });
 
-                    return JSON.stringify(
-                        {
-                            file: resolved.displayPath,
-                            key: result.key,
-                            willWrite: result.willWrite,
-                            wrote: result.wrote,
-                            hasChanges: result.hasChanges,
-                            issues: result.issues,
-                            plan: result.plan,
-                        },
-                        null,
-                        2,
-                    );
+                    return {
+                        content: JSON.stringify(
+                            {
+                                file: resolved.displayPath,
+                                key: result.key,
+                                willWrite: result.willWrite,
+                                wrote: result.wrote,
+                                hasChanges: result.hasChanges,
+                                issues: result.issues,
+                                plan: result.plan,
+                            },
+                            null,
+                            2,
+                        ),
+                    };
                 },
-            }),
-            envsitter_add: tool({
+            });
+            editor.add({
+                name: "envsitter_add",
                 description:
                     "Add a new key to a dotenv file (fails if key already exists). Dry-run unless `write: true`.",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    key: tool.schema.string(),
-                    value: tool.schema.string(),
-                    write: tool.schema.boolean().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        key: { type: "string" },
+                        value: { type: "string" },
+                        write: { type: "boolean" },
+                    },
+                    required: ["key", "value"],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as { filePath?: string; key: string; value: string; write?: boolean };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -575,31 +720,40 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                         write: args.write === true,
                     });
 
-                    return JSON.stringify(
-                        {
-                            file: resolved.displayPath,
-                            key: result.key,
-                            willWrite: result.willWrite,
-                            wrote: result.wrote,
-                            hasChanges: result.hasChanges,
-                            issues: result.issues,
-                            plan: result.plan,
-                        },
-                        null,
-                        2,
-                    );
+                    return {
+                        content: JSON.stringify(
+                            {
+                                file: resolved.displayPath,
+                                key: result.key,
+                                willWrite: result.willWrite,
+                                wrote: result.wrote,
+                                hasChanges: result.hasChanges,
+                                issues: result.issues,
+                                plan: result.plan,
+                            },
+                            null,
+                            2,
+                        ),
+                    };
                 },
-            }),
-            envsitter_set: tool({
+            });
+            editor.add({
+                name: "envsitter_set",
                 description:
                     "Set a key's value in a dotenv file (creates if missing, updates if exists). Dry-run unless `write: true`.",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    key: tool.schema.string(),
-                    value: tool.schema.string(),
-                    write: tool.schema.boolean().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        key: { type: "string" },
+                        value: { type: "string" },
+                        write: { type: "boolean" },
+                    },
+                    required: ["key", "value"],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as { filePath?: string; key: string; value: string; write?: boolean };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -613,30 +767,39 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                         write: args.write === true,
                     });
 
-                    return JSON.stringify(
-                        {
-                            file: resolved.displayPath,
-                            key: result.key,
-                            willWrite: result.willWrite,
-                            wrote: result.wrote,
-                            hasChanges: result.hasChanges,
-                            issues: result.issues,
-                            plan: result.plan,
-                        },
-                        null,
-                        2,
-                    );
+                    return {
+                        content: JSON.stringify(
+                            {
+                                file: resolved.displayPath,
+                                key: result.key,
+                                willWrite: result.willWrite,
+                                wrote: result.wrote,
+                                hasChanges: result.hasChanges,
+                                issues: result.issues,
+                                plan: result.plan,
+                            },
+                            null,
+                            2,
+                        ),
+                    };
                 },
-            }),
-            envsitter_unset: tool({
+            });
+            editor.add({
+                name: "envsitter_unset",
                 description:
                     "Unset a key's value in a dotenv file (sets to empty string, keeps the key). Dry-run unless `write: true`.",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    key: tool.schema.string(),
-                    write: tool.schema.boolean().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        key: { type: "string" },
+                        write: { type: "boolean" },
+                    },
+                    required: ["key"],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as { filePath?: string; key: string; write?: boolean };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -649,30 +812,39 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                         write: args.write === true,
                     });
 
-                    return JSON.stringify(
-                        {
-                            file: resolved.displayPath,
-                            key: result.key,
-                            willWrite: result.willWrite,
-                            wrote: result.wrote,
-                            hasChanges: result.hasChanges,
-                            issues: result.issues,
-                            plan: result.plan,
-                        },
-                        null,
-                        2,
-                    );
+                    return {
+                        content: JSON.stringify(
+                            {
+                                file: resolved.displayPath,
+                                key: result.key,
+                                willWrite: result.willWrite,
+                                wrote: result.wrote,
+                                hasChanges: result.hasChanges,
+                                issues: result.issues,
+                                plan: result.plan,
+                            },
+                            null,
+                            2,
+                        ),
+                    };
                 },
-            }),
-            envsitter_delete: tool({
+            });
+            editor.add({
+                name: "envsitter_delete",
                 description:
                     "Delete key(s) from a dotenv file entirely (removes the line). Dry-run unless `write: true`.",
-                args: {
-                    filePath: tool.schema.string().optional(),
-                    keys: tool.schema.array(tool.schema.string()),
-                    write: tool.schema.boolean().optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        filePath: { type: "string" },
+                        keys: { type: "array", items: { type: "string" } },
+                        write: { type: "boolean" },
+                    },
+                    required: ["keys"],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as { filePath?: string; keys: string[]; write?: boolean };
                     const resolved = resolveDotEnvPath({
                         worktree,
                         directory,
@@ -685,37 +857,42 @@ export const EnvSitterGuard: Plugin = async ({ directory, worktree }) => {
                         write: args.write === true,
                     });
 
-                    return JSON.stringify(
-                        {
-                            file: resolved.displayPath,
-                            keys: result.keys,
-                            willWrite: result.willWrite,
-                            wrote: result.wrote,
-                            hasChanges: result.hasChanges,
-                            issues: result.issues,
-                            plan: result.plan,
-                        },
-                        null,
-                        2,
-                    );
+                    return {
+                        content: JSON.stringify(
+                            {
+                                file: resolved.displayPath,
+                                keys: result.keys,
+                                willWrite: result.willWrite,
+                                wrote: result.wrote,
+                                hasChanges: result.hasChanges,
+                                issues: result.issues,
+                                plan: result.plan,
+                            },
+                            null,
+                            2,
+                        ),
+                    };
                 },
-            }),
-            envsitter_help: tool({
+            });
+            editor.add({
+                name: "envsitter_help",
                 description:
                     "Get comprehensive help on all EnvSitter tools. Call this to understand how to safely work with .env files without exposing secrets.",
-                args: {
-                    topic: tool.schema
-                        .enum([
-                            "overview",
-                            "reading",
-                            "matching",
-                            "mutations",
-                            "file_ops",
-                            "all",
-                        ] as const)
-                        .optional(),
+                input: {
+                    type: "object",
+                    properties: {
+                        topic: {
+                            type: "string",
+                            enum: ["overview", "reading", "matching", "mutations", "file_ops", "all"],
+                        },
+                    },
+                    required: [],
+                    additionalProperties: false,
                 },
-                async execute(args) {
+                async execute(input) {
+                    const args = input as {
+                        topic?: "overview" | "reading" | "matching" | "mutations" | "file_ops" | "all";
+                    };
                     const topic = args.topic ?? "all";
 
                     const overview = `
@@ -881,36 +1058,71 @@ Returns: \`{ file, key, hasChanges, plan: { action: "inserted"|"updated"|"not_fo
                     };
 
                     if (topic === "all") {
-                        return [overview, reading, matching, mutations, fileOps].join("\n---\n");
+                        return { content: [overview, reading, matching, mutations, fileOps].join("\n---\n") };
                     }
 
-                    return sections[topic] ?? overview;
+                    return { content: sections[topic] ?? overview };
                 },
-            }),
-        },
-        "tool.execute.before": async (input, output) => {
-            const filePath = getFilePathFromArgs(output.args);
-            if (!filePath) return;
+            });
+        });
+
+        await ctx.tool.hook("execute.before", async (event) => {
+            const input =
+                typeof event.input === "object" && event.input !== null
+                    ? (event.input as Record<string, unknown>)
+                    : undefined;
+            if (!input) return;
+
+            if (event.tool === "patch") {
+                const patchText = input.patchText;
+                if (typeof patchText !== "string") return;
+                for (const target of extractPatchTargets(patchText)) {
+                    if (isSensitiveDotEnvPath(target) || isEnvSitterPepperPath(target)) {
+                        throw new Error(
+                            "Editing `.env*` and `.envsitter/pepper` via standard tools is blocked. " +
+                                "Use EnvSitter mutation tools: envsitter_add, envsitter_set, envsitter_unset, envsitter_delete. " +
+                                "Call envsitter_help for comprehensive usage guide.",
+                        );
+                    }
+                }
+                return;
+            }
+
+            if (event.tool === "grep") {
+                const references = [input.path, input.include];
+                if (references.some((ref) => typeof ref === "string" && referencesSensitiveEnvFile(ref))) {
+                    throw new Error(
+                        "Grepping `.env*` is blocked to prevent secret leaks (grep previews include values). " +
+                            "Use EnvSitter tools instead (never prints values). " +
+                            "Call envsitter_help for comprehensive usage guide.",
+                    );
+                }
+                return;
+            }
+
+            if (event.tool !== "read" && event.tool !== "edit" && event.tool !== "write") return;
+
+            const rawPath = input.path;
+            if (typeof rawPath !== "string") return;
+            const filePath = stripAtPrefix(rawPath);
 
             if (!isSensitiveDotEnvPath(filePath) && !isEnvSitterPepperPath(filePath)) return;
 
-            if (input.tool === "read") {
+            if (event.tool === "read") {
                 throw new Error(
                     "Reading `.env*` is blocked to prevent secret leaks. " +
                         "Use EnvSitter tools instead (never prints values). " +
-                        "Call envsitter_help for comprehensive usage guide."
+                        "Call envsitter_help for comprehensive usage guide.",
                 );
             }
 
-            if (input.tool === "edit" || input.tool === "write" || input.tool === "patch" || input.tool === "multiedit") {
-                throw new Error(
-                    "Editing `.env*` and `.envsitter/pepper` via standard tools is blocked. " +
-                        "Use EnvSitter mutation tools: envsitter_add, envsitter_set, envsitter_unset, envsitter_delete. " +
-                        "Call envsitter_help for comprehensive usage guide."
-                );
-            }
-        },
-    };
-};
+            throw new Error(
+                "Editing `.env*` and `.envsitter/pepper` via standard tools is blocked. " +
+                    "Use EnvSitter mutation tools: envsitter_add, envsitter_set, envsitter_unset, envsitter_delete. " +
+                    "Call envsitter_help for comprehensive usage guide.",
+            );
+        });
+    },
+});
 
 export default EnvSitterGuard;

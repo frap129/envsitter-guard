@@ -44,7 +44,7 @@
     "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.1.14",
+    "@opencode/plugin": "^2.0.15",
     "envsitter": "^0.0.4"
   },
   "devDependencies": {
