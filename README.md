@@ -7,8 +7,8 @@ OpenCode plugin that prevents agents/tools from reading or editing sensitive `.e
 OpenCode supports loading plugins from npm or local plugin files.
 
 Reference docs:
-- https://opencode.ai/docs/plugins/
-- https://opencode.ai/docs/config/#plugins
+- https://opencode.ai/v2/docs/build/plugins
+- https://opencode.ai/v2/docs/config
 
 ### Option A (recommended): load from npm via `opencode.json`
 
@@ -19,7 +19,7 @@ Add the plugin package to your OpenCode config.
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["envsitter-guard@latest"]
+  "plugins": ["envsitter-guard@latest"]
 }
 ```
 
@@ -84,7 +84,13 @@ Notes for file operations:
 Blocked operations via tool hooks:
 
 - `read` on sensitive `.env*` paths
-- `edit` / `write` / `patch` / `multiedit` on sensitive `.env*` paths
+- `edit` / `write` / `patch` on sensitive `.env*` paths
+- `grep` when its search path or include pattern targets a sensitive `.env*` file (grep previews include values)
+
+Known limitations:
+
+- Greps scoped to a directory can still reach `.env*` content inside it.
+- Partial glob references such as `include: "*env"` or `include: "{.env,.env.local}"` are not recognized as sensitive and are not blocked.
 
 When blocked, the plugin throws an error with guidance on which EnvSitter tools to use instead.
 
@@ -319,7 +325,7 @@ Example (inside OpenCode):
 
 ### Option B: local plugin file (project-level)
 
-If you want a local plugin file in-repo (or need local overrides), create `.opencode/plugin/envsitter-guard.ts`:
+If you want a local plugin file in-repo (or need local overrides), create `.opencode/plugins/envsitter-guard.ts`:
 
 ```ts
 import EnvSitterGuard from "envsitter-guard";
@@ -338,11 +344,11 @@ Then create `.opencode/package.json` with the dependency so OpenCode can install
 }
 ```
 
-Restart OpenCode; files in `.opencode/plugin/` are loaded automatically.
+Restart OpenCode; files in `.opencode/plugins/` are loaded automatically.
 
 ### Option C: global plugin file
 
-Place a plugin file in `~/.config/opencode/plugin/` if you want it enabled for all projects.
+Place a plugin file in `~/.config/opencode/plugins/` if you want it enabled for all projects.
 
 (You can use the same contents as Option B.)
 

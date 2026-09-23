@@ -1,13 +1,13 @@
 # AGENTS.md — envsitter-guard
 
-This repository is a minimal TypeScript plugin meant to run under OpenCode (`@opencode-ai/plugin`).
+This repository is a minimal TypeScript plugin meant to run under OpenCode V2 (`@opencode/plugin`).
 
 ## Repo layout
 
 - `index.ts`: main plugin implementation (`EnvSitterGuard`).
 - `tsconfig.json`: TypeScript config (strict, `noEmit`).
 - `.opencode/`: OpenCode packaging/runtime wrapper.
-  - `.opencode/plugin/envsitter-guard.ts` re-exports the plugin from `index.ts`.
+  - `.opencode/plugins/envsitter-guard.ts` re-exports the plugin from `index.ts`.
   - `.opencode/bun.lock` indicates Bun-managed deps inside `.opencode/`.
 - `node_modules/`: vendored deps (present locally; do not edit).
 
@@ -94,7 +94,7 @@ This plugin is security-sensitive. Follow these patterns:
 ## Working with `.opencode/`
 
 - `.opencode/` is a packaging/runtime layer for OpenCode plugins; treat it as part of the deployment surface.
-- Keep `.opencode/plugin/envsitter-guard.ts` as a thin re-export (do not add logic there).
+- Keep `.opencode/plugins/envsitter-guard.ts` as a thin re-export (do not add logic there).
 - Avoid editing `.opencode/node_modules` directly.
 
 ## Change discipline
@@ -103,19 +103,18 @@ This plugin is security-sensitive. Follow these patterns:
 - Keep behavior consistent with `index.ts` patterns:
   - normalize paths before regex matching
   - ensure file paths stay within `worktree`
-  - throttle UI toasts (`lastToastAt` pattern)
 
 ## Plugin behavior notes
 
-- OpenCode entrypoint is `EnvSitterGuard` exported from `index.ts`.
-- Plugin registration file `.opencode/plugin/envsitter-guard.ts` must remain a thin re-export.
+- OpenCode entrypoint is `EnvSitterGuard` exported from `index.ts` (a V2 `Plugin.define` plugin, `id: "envsitter-guard"`).
+- Plugin registration file `.opencode/plugins/envsitter-guard.ts` must remain a thin re-export.
 - Tool surface area intentionally small:
   - `envsitter_keys`: lists keys only (no values)
   - `envsitter_fingerprint`: deterministic fingerprint of a single key (no value)
-- Blocking behavior is enforced in `"tool.execute.before"`:
+- Blocking behavior is enforced via `ctx.tool.hook("execute.before")`:
   - Blocks reads of `.env*` (except `.env.example`).
-  - Blocks edits/writes/patching of `.env*` and `.envsitter/pepper`.
-  - Throttles UI toasts via `lastToastAt`.
+  - Blocks edits/writes/patching of `.env*` and `.envsitter/pepper` (patch targets are parsed from `patchText`, including `*** Move File:` source and destination).
+  - Blocks greps whose `path`/`include` reference sensitive `.env*` files.
 
 ## Path handling rules
 
@@ -123,6 +122,7 @@ This plugin is security-sensitive. Follow these patterns:
 - Normalize path separators before matching (Windows `\\` → `/`).
 - Validate allowed paths before resolving to absolute paths.
 - Ensure resolved paths stay within `worktree` using `path.relative()` checks.
+- V2 built-in tools pass paths under the `path` arg key; envsitter tools use `filePath`.
 
 ## Output conventions
 
@@ -145,7 +145,7 @@ This plugin is security-sensitive. Follow these patterns:
 
 - `npm run typecheck` passes.
 - No tool path allows reading raw `.env*` values.
-- `.opencode/plugin/envsitter-guard.ts` remains a re-export only.
+- `.opencode/plugins/envsitter-guard.ts` remains a re-export only.
 - Error messages remain clear and do not leak file contents.
 
 ## Cursor / Copilot rules

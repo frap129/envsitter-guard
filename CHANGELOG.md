@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.0
+
+### Changed
+
+- Migrated to the OpenCode V2 plugin API (`@opencode/plugin`). OpenCode V1 is no longer supported.
+- Plugin entrypoint is now `Plugin.define({ id, setup })`; tools register via `ctx.tool.transform`, the guard via `ctx.tool.hook("execute.before")`.
+- Local plugin file moved from `.opencode/plugin/` to `.opencode/plugins/`.
+- `opencode.json` uses the `plugins` key (was `plugin`).
+
+### Added
+
+- `grep` calls targeting sensitive `.env*` files (via `path` or `include`) are now blocked; V2 grep returns line previews which would leak values.
+
+### Removed
+
+- V1-only `multiedit` blocking (V2 has no such tool).
+
 ## 0.0.4
 
 ### Added
