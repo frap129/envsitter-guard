@@ -4,26 +4,30 @@ OpenCode plugin that prevents agents/tools from reading or editing sensitive `.e
 
 ## Quickstart (OpenCode)
 
-OpenCode supports loading plugins from npm or local plugin files.
+OpenCode supports loading plugins from Git, npm, or local plugin files.
 
 Reference docs:
 - https://opencode.ai/v2/docs/build/plugins
 - https://opencode.ai/v2/docs/config
 
-### Option A (recommended): load from npm via `opencode.json`
+### Option A (recommended): install from GitHub via `opencode plugin add`
 
-Add the plugin package to your OpenCode config.
+Run from any project:
 
-`opencode.json`:
+```sh
+opencode plugin add github:frap129/envsitter-guard
+```
+
+Then restart OpenCode. This adds the plugin to your global config (`~/.config/opencode/opencode.json`):
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["envsitter-guard@latest"]
+  "plugins": ["github:frap129/envsitter-guard"]
 }
 ```
 
-Restart OpenCode after updating config.
+Alternatively, add the `plugins` entry to a project-level `opencode.json` manually.
 
 ## Why
 
